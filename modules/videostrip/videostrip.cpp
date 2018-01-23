@@ -6,14 +6,14 @@
 /* Edited:		30/01/2017, 07:12 PM                                */
 /* Description:						                                
 	Module that extracts frames from video for 2D mosaic or 3D model reconstruction. It estimates the overlap among frames
-	by computing the homography matrix. CPU based implementation
+	by computing the homography matrix. Current OpenCV implementation uses GPU acceleration for feature detection and matching
+	through CUDA library.
 */
 
 /********************************************************************/
 /* Created by:                                                      */
 /* Jose Cappelletto - cappelletto@usb.ve			                */
-/* Collaborators:                                                   */
-/* Victor Garcia - victorygarciac@gmail.com							*/
+/* Collaborators: <none>											*/
 /********************************************************************/
 
 ///Basic C and C++ libraries
@@ -33,6 +33,10 @@
 #include "opencv2/calib3d.hpp"
 #include <opencv2/xfeatures2d.hpp>
 
+/// CUDA specific libraries
+#include <opencv2/cudafilters.hpp>
+#include "opencv2/cudafeatures2d.hpp"
+#include "opencv2/xfeatures2d/cuda.hpp"
 
 /// Constant definitios
 #define TARGET_WIDTH	640        //< Resized image width
@@ -40,7 +44,7 @@
 #define OVERLAP_MIN  	0.4        //< Minimum desired overlap among consecutive key frames
 #define DEFAULT_KWINDOW 11         //< Search window size for best blur-based frame, after new key frame
 
-// #define _VERBOSE_ON_
+//#define _VERBOSE_ON_
 // C++ namespaces
 using namespace cv;
 using namespace cv::cuda;
@@ -51,15 +55,6 @@ char keyboard = 0;	// keyboard input character
 
 double t;	// Timing monitor
 
-// Structure to save the reference frame data, useful to reuse keypoints and descriptors
-typedef struct {
-    bool new_img; 
-    vector<KeyPoint> keypoints;
-    Mat descriptors;
-    Mat img;
-    Mat res_img;
-} struct_keyframe;
-
 // General structure index:
 //**** 1- Parse arguments from CLI
 //**** 2- Read input file
@@ -68,12 +63,12 @@ typedef struct {
 //**** 5- Extract following frames
 //****	5.1- Compute Homography matrix
 //****	5.2- Estimate overlapping of current frame with previous keyframe
-//****  5.3- If it falls below threshold, pick best quality frame in the neighbourhood
+//	5.3- If it falls below threshold, pick best quality frame in the neighbourhood
 //****	5.4- Assign it as next keyframe
 //****	5.5 Repeat from 5
 
 // See description in function definition
-float calcOverlap(struct_keyframe* key_frame, Mat image_object);
+float calcOverlap(Mat image_scene, Mat image_object);
 // See description in function definition
 float calcBlur(Mat frame);
 
@@ -101,7 +96,7 @@ int main(int argc, char *argv[]) {
                     "{p      |0.95  | Percent of desired overlap between consecutive frames (0.0 to 1.0)}"
                     "{k      |      | Defines window size of k-frames for keyframe tuning}"
                     "{s      | 0    | Skip NN seconds from the start of the video}"
-                    "{help h usage ?  |       | show this help message}";      // optional, show help optional
+                    "{help h usage ?  |      | show this help message}";      // optional, show help optional
 
     CommandLineParser cvParser(argc, argv, keys);
     cvParser.about("videostrip module v0.3");	//adds "about" information to the parser method
@@ -158,18 +153,18 @@ int main(int argc, char *argv[]) {
 	// TODO: read about possible failure at runtime when calling CUDA methods in non-CUDA hardware.
 	// CHECK whether it is possible with try-catch pair
     cout << "Built with OpenCV " << CV_VERSION << endl;
-    //nCuda = cuda::getCudaEnabledDeviceCount();	// we try to detect any existing CUDA device
-    //cuda::DeviceInfo deviceInfo;
+    nCuda = cuda::getCudaEnabledDeviceCount();	// we try to detect any existing CUDA device
+    cuda::DeviceInfo deviceInfo;
 
-    // if (nCuda > 0)
-    //     cout << "CUDA enabled devices detected: " << deviceInfo.name() << endl;
-    // else {
-    //     cout << "No CUDA device detected" << endl;
-    //     cout << "Exiting... use non-GPU version instead" << endl;
-    // }
+    if (nCuda > 0)
+        cout << "CUDA enabled devices detected: " << deviceInfo.name() << endl;
+    else {
+        cout << "No CUDA device detected" << endl;
+        cout << "Exiting... use non-GPU version instead" << endl;
+    }
 	// TODO: How to operate when multiple CUDA devices are detected?
     // So far, we work with the first detected CUDA device. Maybe, add some CUDA probe mode when called
-    // cuda::setDevice(0);
+    cuda::setDevice(0);
     cout << "***************************************" << endl;
     cout << "Input: " << InputFile << endl;
 
@@ -212,23 +207,21 @@ int main(int argc, char *argv[]) {
     /* PROCESS START */
     // Next, we start reading frames from the input video
     Mat frame(videoWidth, videoHeight, CV_8UC1);
-    Mat bestframe, res_frame;
-    struct_keyframe key_frame;
+    Mat keyframe, bestframe, res_keyframe, res_frame;
 
     bool bImagen = false;
     float over;
     int out_frame = 0, read_frame = 0;
 
     // we use the first frame as keyframe (so far, further implementations should include cli arg to pick one by user)
-    capture.read(key_frame.img);     read_frame ++;
-    key_frame.new_img = true;
+    capture.read(keyframe);     read_frame ++;
     // resizing for speed purposes
-    resize(key_frame.img, key_frame.res_img, cv::Size(hResizeFactor * key_frame.img.cols, hResizeFactor * key_frame.img.rows), 0, 0,
+    resize(keyframe, res_keyframe, cv::Size(hResizeFactor * keyframe.cols, hResizeFactor * keyframe.rows), 0, 0,
            CV_INTER_LINEAR);
 
     OutputFileName.str("");
     OutputFileName << OutputFile << setfill('0') << setw(4) << out_frame << ".jpg";
-    imwrite(OutputFileName.str(), key_frame.img);
+    imwrite(OutputFileName.str(), keyframe);
 
     while (keyboard != 'q' && keyboard != 27) {
         t = (double) getTickCount();
@@ -244,9 +237,9 @@ int main(int argc, char *argv[]) {
 //		cout << ">RESIZE frame-------" << endl;
         resize(frame, res_frame, cv::Size(), hResizeFactor, hResizeFactor);
 //		cout << ">OVERLAP-------" << endl;
-
-        over = calcOverlap(&key_frame, res_frame);
+        over = calcOverlap(res_keyframe, res_frame);
         cout << '\r' << "Frame: " << read_frame << " [" << out_frame << "]\tOverlap: " << over << std::flush;
+
 		//special case: overlap cannot be computed, we force it with an impossible negative value
         // TODO: check better numerically stable way to detect failed overlap detection, rather through forced value
 		if (over == -2.0){
@@ -275,7 +268,6 @@ int main(int argc, char *argv[]) {
 				}
                 read_frame ++;
                 resize(frame, res_frame, cv::Size(), hResizeFactor, hResizeFactor);    //uses a resized version
-                
                 currBlur = calcBlur(res_frame);    //we operate over the resampled image for speed purposes
 
                 cout << '\r' << "Refining for Blur [" << n+1 << "/" << kWindow << "]\tBlur: " << currBlur << "\tBest: " << bestBlur << std::flush;
@@ -285,8 +277,7 @@ int main(int argc, char *argv[]) {
                 }
             }
             //< finally the new keyframe is the best frame from las iteration
-            key_frame.img = bestframe.clone();
-            key_frame.new_img = true;
+            keyframe = bestframe.clone();
 //            cout << " >> best frame found";
             out_frame ++;
 
@@ -303,7 +294,7 @@ int main(int argc, char *argv[]) {
             t = (double) getTickCount();
 #endif
 			cout << "..." << endl;
-            resize(key_frame.img, key_frame.res_img, cv::Size(), hResizeFactor, hResizeFactor);
+            resize(keyframe, res_keyframe, cv::Size(), hResizeFactor, hResizeFactor);
 //			cout << ">RESIZE keyframe-------" << endl;
         }
 
@@ -324,15 +315,21 @@ int main(int argc, char *argv[]) {
 */
 float calcBlur(Mat frame) {
     // Avg time: 0.7 ms GPU/ 23ms CPU
-    Mat grey, laplacian;    
+    Mat grey, laplacian;
+    cuda::GpuMat gpuFrame, gpuLaplacian;
     cvtColor(frame, grey, COLOR_BGR2GRAY);
 
+    //upload into GPU memory
+    gpuFrame.upload(grey);
     //perform Laplacian filter
-    Laplacian(grey, laplacian, grey.type(), CV_16S);
+    Ptr<cuda::Filter> filter = cuda::createLaplacianFilter(gpuFrame.type(), gpuLaplacian.type(), 1, 1);
+    filter->apply(gpuFrame, gpuLaplacian);    //**/
+    //download from GPU memory
+    gpuLaplacian.download(laplacian);
 
     //we compute the laplacian of the current frame
     Scalar mean, stdev;
-    // then we compute the mean and stdev of that frame
+    // the we compute the mean and stdev of that frame
     meanStdDev(laplacian, mean, stdev);
     // double m = mean.val[0];
     // double s = stdev.val[0];
@@ -340,15 +337,16 @@ float calcBlur(Mat frame) {
     return stdev.val[0];
 }
 
-/*! @fn float calcOverlap(struct_keyframe* key_frame, Mat img_object)
+/*! @fn float calcOverlap(Mat img_scene, Mat img_object)
     @brief Calculates the percentage of overlapping among two frames, by estimating the Homography matrix.
-    @param key_frame	Structure container of reference frame, keypoints and descriptors
+    @param
+            img_scene	Mat OpenCV matrix container of reference frame
     @param img_object	Mat OpenCV matrix container of target frame
 	@brief retval		The normalized overlap among two given frame
 */
-float calcOverlap(struct_keyframe* key_frame, Mat img_object) {
+float calcOverlap(Mat img_scene, Mat img_object) {
 	// if any of the input images are empty, then exits with error code
-    if (! img_object.data || ! key_frame->res_img.data) {
+    if (! img_object.data || ! img_scene.data) {
         cout << " --(!) Error reading images " << std::endl;
         return - 1;
     }
@@ -358,50 +356,52 @@ float calcOverlap(struct_keyframe* key_frame, Mat img_object) {
     int minHessian = 400;
     Mat descriptors_object, descriptors_scene;
     vector<KeyPoint> keypoints_object, keypoints_scene;
-    Ptr<SURF> detector = SURF::create(minHessian);
+
+    cuda::GpuMat gpu_img_object, gpu_img_scene;
+    cuda::GpuMat gpu_keypoints_object, gpu_keypoints_scene;
+    cuda::GpuMat gpu_descriptors_object, gpu_descriptors_scene;
 
     // Convert to grayscale
     cvtColor(img_object, img_object, COLOR_BGR2GRAY);
-
+    cvtColor(img_scene, img_scene, COLOR_BGR2GRAY);
+    // Upload to GPU
+    gpu_img_object.upload(img_object);
+    gpu_img_scene.upload(img_scene);
     // Detect keypoints
-    detector->detectAndCompute(img_object, Mat(), keypoints_object, descriptors_object);
+    cuda::SURF_CUDA surf(minHessian);
+    surf(gpu_img_object, cuda::GpuMat(), gpu_keypoints_object, gpu_descriptors_object);
+    surf(gpu_img_scene, cuda::GpuMat(), gpu_keypoints_scene, gpu_descriptors_scene);//*/
 
-    // If we have a new keyframe compute the keypoints, else reuse them
-    if(key_frame->new_img){
-        cvtColor(key_frame->res_img, key_frame->res_img, COLOR_BGR2GRAY);
-        detector->detectAndCompute(key_frame->res_img, Mat(), key_frame->keypoints, key_frame->descriptors);
-        key_frame->new_img = false;
-    }
-
-    keypoints_scene = key_frame->keypoints;
-    descriptors_scene = key_frame->descriptors;
+    //-- Step 3: Matching descriptor vectors using BruteForceMatcher
+    surf.downloadKeypoints(gpu_keypoints_scene, keypoints_scene);
+    surf.downloadKeypoints(gpu_keypoints_object, keypoints_object);
 
 #ifdef _VERBOSE_ON_
     t = 1000 * ((double) getTickCount() - t) / getTickFrequency();
-    cout << endl << "SURF: " << t << " ms ";
+    cout << endl << "SURF@GPU: " << t << " ms ";
     t = (double) getTickCount();
 #endif
 
     //***************************************************************//
-    //-- Step 2: Matching descriptor vectors using Flann based matcher
+    //-- Step 3: Matching descriptor vectors using GPU BruteForce matcher (instead CPU FLANN)
     // Avg time: 2.5 ms GPU / 21 ms CPU
-        //	cout << ">>[OV] SURF ok-------" << endl;
-    vector<DMatch> matches;
-
-    FlannBasedMatcher matcher;
-    matcher.match(descriptors_object, descriptors_scene, matches);
-
-    //-- Step 3: Select only good matches
-    vector<DMatch> good_matches;
+    double max_dist = 0;
     double min_dist = 100;
-    for( int i = 0; i < matches.size(); i++ ){
-        double dist = matches[i].distance;
-        if( dist < min_dist )
-            min_dist = dist;
-    }
-    for( int i = 0; i < matches.size(); i++ ){
-        if( matches[i].distance <= max(2*min_dist, 0.6) ){
-            good_matches.push_back( matches[i]);
+
+//	cout << ">>[OV] SURF ok-------" << endl;
+
+    Ptr<cuda::DescriptorMatcher> matcher_gpu = cuda::DescriptorMatcher::createBFMatcher();
+    vector<vector<DMatch> > matches_gpu;
+    matcher_gpu->knnMatch(gpu_descriptors_object, gpu_descriptors_scene, matches_gpu, 2);
+
+    //-- Step 4: Select only good matches
+    std::vector<DMatch> good_matches_gpu;
+    for (int k = 0; k < std::min(keypoints_object.size() - 1, matches_gpu.size()); k ++) {
+        if ((matches_gpu[k][0].distance < 0.8 * (matches_gpu[k][1].distance)) &&
+            ((int) matches_gpu[k].size() <= 2 && (int) matches_gpu[k].size() > 0)) {
+            // take the first result only if its distance is smaller than 0.6*second_best_dist
+            // that means this descriptor is ignored if the second distance is bigger or of similar
+            good_matches_gpu.push_back(matches_gpu[k][0]);
         }
     }
 
@@ -415,7 +415,7 @@ float calcOverlap(struct_keyframe* key_frame, Mat img_object) {
 
     //***************************************************************//
     //we must check if found H matrix is good enough. It requires at least 4 points
-    if (good_matches.size() < 4) {
+    if (good_matches_gpu.size() < 4) {
         cout << "[WARN] Not enough good matches!" << endl;
         //we fail to estimate new overlap
         return -2.0;
@@ -424,10 +424,10 @@ float calcOverlap(struct_keyframe* key_frame, Mat img_object) {
         //-- Localize the object
         vector<Point2f> obj, scene;
 
-        for (int i = 0; i < good_matches.size(); i ++) {
+        for (int i = 0; i < good_matches_gpu.size(); i ++) {
             //-- Get the keypoints from the good matches
-            obj.push_back(keypoints_object[good_matches[i].queryIdx].pt);
-            scene.push_back(keypoints_scene[good_matches[i].trainIdx].pt);
+            obj.push_back(keypoints_object[good_matches_gpu[i].queryIdx].pt);
+            scene.push_back(keypoints_scene[good_matches_gpu[i].trainIdx].pt);
         }
 
         // TODO: As OpenCV 3.2, there is no GPU based implementation for findHomography.
