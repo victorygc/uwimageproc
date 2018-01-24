@@ -3,5 +3,5 @@
 .vscode
 uwimageproc
 modules/videostrip/build
-videostrip
+modules/videostrip/doc
 build
