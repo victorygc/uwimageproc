@@ -3,10 +3,5 @@
 .vscode
 uwimageproc
 modules/videostrip/build
-<<<<<<< HEAD
 build
 videostrip
-=======
-videostrip
-build
->>>>>>> CPU_based
